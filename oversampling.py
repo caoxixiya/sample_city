@@ -1,5 +1,5 @@
 '''
-stable: unstable = 530000:530000
+stable: unstable = 547853:3343
 '''
 import os
 import torch
@@ -12,45 +12,13 @@ import random
 from random import shuffle
 
 seed = 0
+BATCH_SIZE = 1024
+EPOCHS = 100
+
 random.seed(seed)
 np.random.seed(seed)
 os.environ['PYTHONHASHSEED'] = str(seed)
 torch.manual_seed(seed)
-
-global train_size
-global test_size
-global BATCH_SIZE
-global train_unstable_size
-
-
-BATCH_SIZE = 2560
-EPOCHS = 100
-
-writer = SummaryWriter('logs_780000')
-data = np.load('city1_data.npy', allow_pickle=True)
-
-
-train_size = int(len(data)*0.7)
-test_size = len(data) - train_size
-shuffle(data)
-train_index = np.random.choice(len(data), train_size, replace=False)
-train_dataset = data[:train_size]
-test_dataset = data[train_size:]
-train_label = train_dataset[:, -1]
-
-index_unstable = np.where(train_label==1)[0]
-index_stable = np.where(train_label==0)[0]
-
-
-train_stable = train_dataset[index_stable]
-train_unstable = train_dataset[index_unstable]
-train_unstable = np.repeat(train_unstable, int(len(train_stable)/len(train_unstable)), axis=0)
-train_unstable_size = train_unstable.shape[0]
-
-train_stable_loader = torch.utils.data.DataLoader(train_stable, batch_size=BATCH_SIZE, shuffle=True)
-train_unstable_loader = torch.utils.data.DataLoader(train_unstable, batch_size=BATCH_SIZE, shuffle=True)
-
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 class Classifier(torch.nn.Module):
     def __init__(self, obs_dim, n_output):
@@ -73,12 +41,16 @@ class Classifier(torch.nn.Module):
         pre = self.pre(x)        
         return pre
 
-def train(model, train_stable_loader ,train_unstable_loader , optimizer, epoch):
+
+def train(model, train_stable_loader ,train_unstable, optimizer, epoch):
     model.train()
     num_batch = 0   
-    train_loss_sum = 0 
-    for train_stable, train_unstable in zip(train_stable_loader, train_unstable_loader):  
-        data_batch = torch.cat((train_stable, train_unstable), 0)
+    train_loss_sum = 0     
+    for train_stable_batch in train_stable_loader:  
+        train_unstable_batch_index = np.random.choice(len(train_unstable), BATCH_SIZE, replace=False)
+        train_unstable_batch = train_unstable[train_unstable_batch_index]
+        train_unstable_batch = torch.from_numpy(train_unstable_batch)
+        data_batch = torch.cat((train_stable_batch, train_unstable_batch), 0)
         train_x = data_batch[:, :-1].to(torch.float32)
         train_y = data_batch[:, -1].to(torch.long)
         optimizer.zero_grad()               
@@ -89,16 +61,16 @@ def train(model, train_stable_loader ,train_unstable_loader , optimizer, epoch):
         optimizer.step()
         if num_batch%30 == 0: 
             print('Train Epoch: {} [{}/{}]\tLoss: {:.6f}'.format(
-                epoch, int(num_batch * BATCH_SIZE), train_unstable_size,
+                epoch, int(num_batch * BATCH_SIZE), train_stable_size,
                 train_loss.item()))    
         num_batch+=1   
     writer.add_scalar('train_loss',train_loss_sum/num_batch, epoch)  
-
     
 
 def test(model, test_loader, epoch):
-    test_loss = 0                           
-    num_batch = 0    
+    model.eval()
+    num_batch = 0 
+    test_loss = 0 
     with torch.no_grad():
         for data in test_loader:  
             test_x = data[:, :-1].to(torch.float32)
@@ -112,12 +84,10 @@ def test(model, test_loader, epoch):
             target_y = test_y.numpy()
             if num_batch==0:
                 pred_list = pred_y
-            else:
-                pred_list = np.concatenate((pred_list, pred_y), axis=0)
-            if num_batch==0:
                 target_list = target_y
             else:
-                target_list = np.concatenate((target_list, target_y), axis=0)
+                pred_list = np.concatenate((pred_list, pred_y), axis=0)
+                target_list = np.concatenate((target_list, target_y), axis=0)            
             num_batch+=1      
 
         test_loss = test_loss/num_batch        
@@ -132,12 +102,34 @@ def test(model, test_loader, epoch):
         writer.add_scalar('auc', auc, epoch)
         writer.add_scalar('acc', acc, epoch)
 
-model = Classifier(len(data[0])-1, 2)
-optimizer = torch.optim.Adam(model.parameters(),lr=0.0001)
-loss_func = torch.nn.CrossEntropyLoss()
 
-for epoch in range(EPOCHS):    
-    train(model, train_stable_loader ,train_unstable_loader , optimizer, epoch)
-    test(model, test_loader, epoch)
+if __name__ == '__main__':
+    writer = SummaryWriter('tmp_classification')
+    data = np.load('data.npz') 
+    X = data['X']
+    Y = data['Y'].reshape((len(X), 1))   
+    data = np.hstack((X[:, 59:], Y[:]))
+    shuffle(data)
+    train_size = int(len(data)*0.8)
+    test_size = len(data) - train_size 
+    train_dataset = data[:train_size]
+    test_dataset = data[train_size:]
 
-writer.close()
+    train_label = train_dataset[:, -1]
+    index_unstable = np.where(train_label==1)[0]
+    index_stable = np.where(train_label==0)[0]
+    train_stable = train_dataset[index_stable]
+    train_unstable = train_dataset[index_unstable]
+    train_stable_size = train_stable.shape[0]
+    train_stable_loader = torch.utils.data.DataLoader(train_stable, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    model = Classifier(len(data[0])-1, 2)
+    optimizer = torch.optim.Adam(model.parameters(),lr=0.0001)
+    loss_func = torch.nn.CrossEntropyLoss()
+
+    for epoch in range(EPOCHS):    
+        train(model, train_stable_loader ,train_unstable , optimizer, epoch)
+        test(model, test_loader, epoch)
+
+    writer.close()
